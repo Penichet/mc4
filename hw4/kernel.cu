@@ -155,11 +155,11 @@ int main() {
         outfile << ans;
         outfile.close();
     }
-    else cout << "Unable to open file";
+    //else cout << "Unable to open file";
 
     //print stuff
-    cout << "minimum entry found: " << ans << endl;
-    cout << "elapsted reduce time: " << elapsedTime << endl;
+    //cout << "minimum entry found: " << ans << endl;
+    //cout << "elapsted reduce time: " << elapsedTime << endl;
 
     //free device memory
     cudaFree(d_arr);
@@ -213,14 +213,15 @@ int main() {
         
         outfile2.close();
     }
-    else cout << "Unable to open file";
+    //else cout << "Unable to open file";
     
  
     //time taken output
-    cout << "Parity time taken: " << b_time << endl;
+    //cout << "Parity time taken: " << b_time << endl;
 
     cudaFree(d_arrb);
     cudaFree(d_outb);
+    free(ans_arr);
 
     return 0;
 }
