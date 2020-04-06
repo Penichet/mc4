@@ -6,6 +6,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <cassert>
 
 using namespace std;
 
@@ -74,6 +75,30 @@ void reduce(int* d_out, int* d_intermediate, int* d_in, int size)
 }
 
 
+__global__ void global_parity(int* d_out, int* d_in, int size) {
+    //indices
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    //idiomatic code from nvidia help
+    for (int i = index; i < size; i += stride) {
+        d_out[i] = d_in[i] % 10;
+    }
+}
+
+void parity(int* d_out, int* d_in, int size) {
+    const int maxThreadsPerBlock = 512;
+    int threads = maxThreadsPerBlock;
+    //ceiling of blocks required
+    int blocks = (size / maxThreadsPerBlock) + 1;
+
+    //run kernel
+    global_parity <<<blocks, threads>>> (d_out, d_in, size);
+
+    //wait for all threads to synch
+    cudaDeviceSynchronize();
+}
+
+
 int main() {
     vector<int> arr;
     string line;
@@ -122,13 +147,80 @@ int main() {
     float elapsedTime;
     cudaEventElapsedTime(&elapsedTime, start, stop);
 
+
+    //output to file
+    ofstream outfile("q1a.txt");
+    if (outfile.is_open())
+    {
+        outfile << ans;
+        outfile.close();
+    }
+    else cout << "Unable to open file";
+
     //print stuff
     cout << "minimum entry found: " << ans << endl;
-    cout << "elapsted time: " << elapsedTime << endl;
+    cout << "elapsted reduce time: " << elapsedTime << endl;
 
+    //free device memory
     cudaFree(d_arr);
     cudaFree(d_intermediate);
-    cudaFree(d_arr);
+    cudaFree(d_out);
+
+    //////////////////////////////////***PARITY CODE***///////////////////////////////////////
+
+    //allocate device memory
+    int* d_arrb, * d_outb;
+    cudaMalloc((void**)&d_arrb, arr.size() * sizeof(int));
+    cudaMalloc((void**)&d_outb, arr.size() * sizeof(int));
+
+    //copy array A to device Memory
+    cudaMemcpy(d_arrb, &arr[0], arr.size() * sizeof(int), cudaMemcpyHostToDevice);
+    
+    //cuda events
+    cudaEvent_t b1, b2;
+    cudaEventCreate(&b1);
+    cudaEventCreate(&b2);
+
+
+    //run parity
+    cudaEventRecord(b1, 0);
+    parity(d_outb, d_arrb, arr.size());
+    cudaEventRecord(b2, 0);
+
+    //calc time
+    float b_time;
+    cudaEventElapsedTime(&b_time, b1, b2);
+
+    //store answer on host
+    int* ans_arr = (int*)malloc(sizeof(int) * arr.size());
+    cudaMemcpy(ans_arr, d_outb, sizeof(int) * arr.size(), cudaMemcpyDeviceToHost);
+
+    //validate
+     /*for (int i = 0; i < arr.size(); i++) {
+         assert(arr[i] % 10 == ans_arr[i]);
+     }*/
+
+
+    //output to file
+    ofstream outfile2("q1b.txt");
+    if (outfile2.is_open())
+    {
+        //avoid comma at end of string
+        outfile2 << ans_arr[0];
+        for (int i = 1; i < arr.size(); i++) {
+            outfile2 << "," << ans_arr[i];
+        }
+        
+        outfile2.close();
+    }
+    else cout << "Unable to open file";
+    
+ 
+    //time taken output
+    cout << "Parity time taken: " << b_time << endl;
+
+    cudaFree(d_arrb);
+    cudaFree(d_outb);
 
     return 0;
 }
