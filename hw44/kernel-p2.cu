@@ -11,22 +11,19 @@ using namespace std;
 __global__ void global_get_flags(int* d_in, int* flags, int mask, int size) {
     //indices
     int myId = threadIdx.x + blockDim.x * blockIdx.x;
-
-    if (myId < size) {
-        //MAP 0s as 1 in flags array
-        if ((mask & d_in[myId]) == 0) {
-            flags[myId] = 1;
-        }
-        else {
-            flags[myId] = 0;
-        }
-        //synch all threads
-        __syncthreads();
+    //MAP 0s as 1 in flags array
+    if (myId < size && (mask & d_in[myId]) == 0) {
+        flags[myId] = 1;
     }
+    else {
+        flags[myId] = 0;
+    }
+    //synch all threads
+    __syncthreads();
 }
 
 
-__global__ void prescan(int* d_out, int* scan_store, int* flag, int size, bool store) {
+__global__ void prescan(int* d_out, int* scan_store, int* flag, int size, bool store, bool pad_finals) {
     int myId = threadIdx.x + blockDim.x * blockIdx.x;
     int tid = threadIdx.x;
     //size is num of threads, but need to check compared to size * block -- ACCOUNT FOR 2x thread 
@@ -42,7 +39,7 @@ __global__ void prescan(int* d_out, int* scan_store, int* flag, int size, bool s
         }
         __syncthreads(); 
     }
-
+    __syncthreads();
      //clear the last element
     if (tid == 0) {
         d_out[(size * (blockIdx.x+1)) - 1] = 0;
@@ -59,13 +56,21 @@ __global__ void prescan(int* d_out, int* scan_store, int* flag, int size, bool s
         }
         __syncthreads();
     }
-
+    __syncthreads();
     //store the last element if thread 0 at block index
-    if (tid == 0 && store) {
+    if (tid == size -1 && store) {
         scan_store[blockIdx.x] = d_out[(size * (blockIdx.x + 1)) - 1] + flag[(size * (blockIdx.x + 1)-1)];
     }
     __syncthreads();
 }
+
+//__global__ void find_max(int* scan_store, int* scan, int* flag, int size) {
+//        //launch one block with "blocks" threads, to store max
+//        int tid = threadIdx.x;
+//        scan_store[tid] = scan[(size * (tid + 1)) - 1] + flag[(size * (tid + 1) - 1)];
+//        __syncthreads();
+//}
+
 
 __global__ void combine(int* d_out, int* results, int* mini, int size, int* numFalse, int* scan) {
     int myId = threadIdx.x + blockDim.x * blockIdx.x;
@@ -74,7 +79,9 @@ __global__ void combine(int* d_out, int* results, int* mini, int size, int* numF
         presum = mini[blockIdx.x];
     }
     __syncthreads();
+    if (myId < size) {
     results[myId] += presum;
+    }
     __syncthreads();
     // store largest num in numFalse pointer location
     if (myId == size -1 ) {
@@ -88,25 +95,27 @@ __global__ void combine(int* d_out, int* results, int* mini, int size, int* numF
 __global__ void shuffle(int* d_out, int* d_in, int* scan, int* numFalse, int size, int mask) {
     //overlap at 1015 at end of cycle with storing indices
     int myId = threadIdx.x + blockDim.x * blockIdx.x;
-    int t = myId - scan[myId] + *numFalse; // true index for all
-    __syncthreads();
+    int t;
+        if(myId<size)
+            t = myId - scan[myId] + *numFalse; // true index for all
+        __syncthreads();
 
-    /*if ((mask & d_in[myId]) == 0) d_out[myId] = scan[myId];
-    else d_out[myId] = t; 
-    __syncthreads();*/
-    //use scan value if bit is 0, use t otherwise
-    if ((mask & d_in[myId]) == 0) d_out[scan[myId]] = d_in[myId];
-    else d_out[t] = d_in[myId];
-    __syncthreads();
-    
-    //////copy to d_in to redo next layer
-    //d_in[myId] = d_out[myId];
-    //__syncthreads();
+        /*if ((mask & d_in[myId]) == 0) d_out[myId] = scan[myId];
+        else d_out[myId] = t;
+        __syncthreads();*/
+        //use scan value if bit is 0, use t otherwise
+        if (myId < size)
+            if ((mask & d_in[myId]) == 0) d_out[scan[myId]] = d_in[myId];
+            else d_out[t] = d_in[myId];
+        __syncthreads();
 
-    ////clear used arrays
-    scan[myId] = 0;
-    __syncthreads();
-    
+        //////copy to d_in to redo next layer
+        //d_in[myId] = d_out[myId];
+        //__syncthreads();
+
+        ////clear used arrays
+        //if (myId < size) scan[myId] = 0;
+        //__syncthreads();
     ////run next bit mask
 }
 
@@ -125,20 +134,24 @@ int main() {
           Account for each thread taking care of 2 elements in prescan
           Free cuda memory after
           Account for myId > size in new functions 
-          Figure out why it works with manual iterations
     */
-    int size = 8192;
+    //253,272,249,268,251,270,258,251 at 4096
+    int size = 3750; //3750
+    bool pad_final = false;
     const int maxThreadsPerBlock = 512;
     int threads = maxThreadsPerBlock;
     int blocks = (size / maxThreadsPerBlock);
-    if (size % threads != 0) {
+    int mod = size % threads;
+    if (mod > 0) {
         blocks++;
+        pad_final = true;
     }
+
     vector<int> arr;
     string line;
     int mask = 1 << 0;
     ifstream myfile("inp.txt");
-    ofstream outfile2("testfull.txt");
+    ofstream outfile2("testscan.txt");
     if (myfile.is_open())
     {
         //gets next int
@@ -151,12 +164,21 @@ int main() {
         }
         myfile.close();
     }
+    //bootleg push 2 for everything, try to not shuffle the end
+    for (int i = 0; i < threads-mod; i++) {
+        arr.push_back(2);
+    }
 
+    //int size = arr.size();
     //allocate device memory
     int* d_in, * d_out, * scan, * flags, * scan_store, * scan_large, *numFalse;
     int* h_false = (int*)malloc(sizeof(int));
     cudaMalloc((void**)&d_out, arr.size() * sizeof(int));
+    //cudaMalloc((void**)&flags, arr.size() * sizeof(int));
+
+    //allocate memory for full size of blocks, only write to actual values
     cudaMalloc((void**)&flags, arr.size() * sizeof(int));
+    
     cudaMalloc((void**)&scan, arr.size() * sizeof(int));
     cudaMalloc((void**)&scan_store, blocks * sizeof(int));
     cudaMalloc((void**)&scan_large, blocks * sizeof(int));
@@ -174,9 +196,10 @@ int main() {
         global_get_flags << <blocks, threads >> > (d_in, flags, mask, size);
         cudaDeviceSynchronize();
         //do scan on each block and store results in scan_store - set size to threads/2 to run on a single block
-        prescan <<<blocks, threads >>> (scan, scan_store, flags, threads, true);
+        prescan <<<blocks, threads >>> (scan, scan_store, flags, threads, true, pad_final);
         cudaDeviceSynchronize();
         //////////////////////////
+
         int* h_scan = (int*)malloc(sizeof(int) * blocks);
         cudaMemcpy(h_scan, scan_store, sizeof(int) * blocks, cudaMemcpyDeviceToHost);
         cout << "SCAN_STORE: " << h_scan[0];
@@ -185,18 +208,19 @@ int main() {
         }
         cout << endl;
         //////////////////////////
-        //do scan on array of scan results - somehow only on small
-        prescan << <1, blocks >> > (scan_large, NULL, scan_store, blocks, false);
+        //do scan on array of scan results 
+        prescan << <1, blocks >> > (scan_large, NULL, scan_store, blocks, false, false);
         cudaDeviceSynchronize();
         //works for 8192 and 16 so far. probably because powers of 2
         combine << <blocks, threads >> > (d_out, scan, scan_large, size, numFalse, flags);
         cudaDeviceSynchronize();
-        // also works for 8192
+        //// also works for 8192
         cudaMemcpy(h_false, numFalse, sizeof(int), cudaMemcpyDeviceToHost);
         printf("number of false: %d\n", h_false[0]); //NUm false works correctly
-        //shuffle
+        ////shuffle
         shuffle << <blocks, threads >> > (d_out, d_in, scan, numFalse, size, mask);
         cudaDeviceSynchronize();
+        ////move d_out to d_in to redo
         swap << <blocks, threads >> > (d_in, d_out, size);
         cudaDeviceSynchronize();
     }
@@ -204,8 +228,8 @@ int main() {
     /////////////////////////////////////////////////////////////////////////
 
     //copy results
-    //int* ans_arr = (int*)malloc(sizeof(int) * arr.size());
-    int* ans_arr = (int*)malloc(sizeof(int) * arr.size());
+    
+    int* ans_arr = (int*)malloc(sizeof(int) * (arr.size() + mod));
     cudaMemcpy(ans_arr, d_in, sizeof(int) * arr.size(), cudaMemcpyDeviceToHost);
    
 
