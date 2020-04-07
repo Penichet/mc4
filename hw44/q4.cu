@@ -142,7 +142,7 @@ int main() {
     }
     //size calculations plus padding
     int size = arr.size();
-    cout << arr.size() << endl;
+    //cout << arr.size() << endl;
     const int maxThreadsPerBlock = 1024;
     int threads = maxThreadsPerBlock;
     int blocks = (size / maxThreadsPerBlock);
