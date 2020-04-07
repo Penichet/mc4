@@ -132,7 +132,7 @@ void bucket(int* d_out, int* d_in, int* flags, int* scan, int size) {
         blocks++;
     }
     //more than 1024 is messed up, prolly bc 1024 threads per block
-    global_bucket_sort <<<1, 512>>> (d_out, d_in, flags, scan, size);
+    global_bucket_sort <<<blocks, threads>>> (d_out, d_in, flags, scan, size);
 
 
     //prefix_scan <<<blocks, threads >>> (scan, temp, temparr.size());
