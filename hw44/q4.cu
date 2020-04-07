@@ -123,52 +123,32 @@ __global__ void global_bucket_sort(int* d_out, int* d_in, int* flags, int* scan,
 
 
 void bucket(int* d_out, int* d_in, int* flags, int* scan, int size) {
-    size = 512;
+   
     //size over 10000 bugs out????
     const int maxThreadsPerBlock = 512;
     int threads = maxThreadsPerBlock;
     int blocks = (size / maxThreadsPerBlock);
-    if (size % threads > 0) {
+    if (size % threads != 0) {
         blocks++;
     }
-    //global_bucket_sort <<<blocks, threads>>> (d_out, d_in, flags, scan, size);
-
-    ////////// testing scan///////////////////////////////////////////
-    int* temp;
-    vector<int> temparr;
-    string line;
-    ifstream myfile("inp.txt");
-    if (myfile.is_open())
-    {
-        //gets next int
-        int numin = 0;
-        while (getline(myfile, line, ',') && numin < 512)
-        {
-            temparr.push_back(stoi(line, nullptr));
-            numin++;
-        }
-        myfile.close();
-    }
-    cudaMalloc((void**)&temp, temparr.size() * sizeof(int));
-    cudaMemcpy(temp, &temparr[0], temparr.size() * sizeof(int), cudaMemcpyHostToDevice);
-    //printf("starting prefix scan\n");
     //more than 1024 is messed up, prolly bc 1024 threads per block
-    global_bucket_sort <<<1, 512>>> (d_out, temp, flags, scan, size);
+    global_bucket_sort <<<1, 512>>> (d_out, d_in, flags, scan, size);
 
 
     //prefix_scan <<<blocks, threads >>> (scan, temp, temparr.size());
-    int* ans_scan = (int*)malloc(sizeof(int) * temparr.size());
+    /*int* ans_scan = (int*)malloc(sizeof(int) * temparr.size());
     cudaMemcpy(ans_scan, d_out, sizeof(int) * temparr.size(), cudaMemcpyDeviceToHost);
     cout << ans_scan[0];
     for (int i = 1; i < size; i++) {
         cout << "," << ans_scan[i];
-    }
+    }*/
     /////////////////////////////
 
 }
 
 int main(){
     //READING ONLY 8192 for simplicity, no padding
+    int size = 512;
     vector<int> arr;
     string line;
     ifstream myfile("inp.txt");
@@ -176,7 +156,7 @@ int main(){
     {
         //gets next int
         int numin = 0;
-        while (getline(myfile, line, ',') && numin<512)
+        while (getline(myfile, line, ',') && numin<size)
         {
             arr.push_back(stoi(line, nullptr));
             numin++;
@@ -192,8 +172,6 @@ int main(){
     cudaMalloc((void**)&d_out, arr.size() * sizeof(int));
     cudaMalloc((void**)&flags, arr.size() * sizeof(int));
     cudaMalloc((void**)&scan, arr.size() * sizeof(int));
-    //cudaMalloc((void**)&temp, arr.size() * sizeof(int));
-
 
     // treat pointer to start of vector as array pointer
     cudaMemcpy(d_arr, &arr[0], arr.size() * sizeof(int), cudaMemcpyHostToDevice);
@@ -210,19 +188,19 @@ int main(){
 
     //copy results
     int* ans_arr = (int*)malloc(sizeof(int) * arr.size());
+    cudaMemcpy(ans_arr, d_out, sizeof(int) * arr.size(), cudaMemcpyDeviceToHost);
     //cudaMemcpy(ans_arr, flags, sizeof(int) * arr.size(), cudaMemcpyDeviceToHost);
-    cudaMemcpy(ans_arr, flags, sizeof(int) * arr.size(), cudaMemcpyDeviceToHost);
 
-    //output to file
-    //ofstream outfile2("q4.txt");
-    //if (outfile2.is_open())
-    //{
-    //    //avoid comma at end of string
-    //    outfile2 << ans_arr[0];
-    //    for (int i = 1; i < arr.size(); i++) {
-    //        outfile2 << "," << ans_arr[i];
-    //    }
+   // output to file
+    ofstream outfile2("q4.txt");
+    if (outfile2.is_open())
+    {
+        //avoid comma at end of string
+        outfile2 << ans_arr[0];
+        for (int i = 1; i < arr.size(); i++) {
+            outfile2 << "," << ans_arr[i];
+        }
 
-    //    outfile2.close();
-    //}
+        outfile2.close();
+    }
 }
