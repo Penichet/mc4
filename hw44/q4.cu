@@ -10,76 +10,47 @@ using namespace std;
 
 //https://developer.nvidia.com/gpugems/gpugems3/part-vi-gpu-computing/chapter-39-parallel-prefix-sum-scan-cuda
 //child kernel for prefix scan - NOT SURE IF INCLUSIVE OR EXCLUSIVE
-__forceinline __device__ void prefix_scan(int* d_out, int* flag, int* temp,  int size) {
+//__device__ void prefix_scan(int* d_out, int* flag, int* temp,  int size) {
+__global__ void prefix_scan(int* d_out, int* flag, int size) {
     //TODO: need to adjust size to multiple of 2 and also resize temp array 
 
     int myId = threadIdx.x + blockDim.x * blockIdx.x;
     //need to initialize all in temp to 0?
     
-    d_out[myId] = flag[myId]; // load inputs into memory , maybe need to do 2 elements?
+    d_out[myId] = flag[myId]; // load inputs into memory 
 
-    //for h = 0 to(log n) - 1 do
-    //    for all i from 0 to n - 1 in step of 2 ^ (h + 1) in parallel do
-    //        B[i + 2 ^ (h + 1) - 1] = B[i + 2 ^ (h)-1] + B[i + 2 ^ (h + 1) - 1]; // Parent = sum of children
-    //       temp(myId + h*2 -1) = temp(myId + h -1) + temp (myId + h*2 -1); - math replacement for log
-    //int step = 2;
     for (int h = 1; h < size; h *= 2) {
-        int index = 2* myId + h * 2 - 1;
+        int index = h*2* myId + h * 2 - 1;
         if(index < size) { //check if myid +step is smaller than size
-            d_out[index] += d_out[2* myId + h - 1];
-            // 1,2,3,4,5,0,0,0
-            // h = 1, out(2i + 1) += out(2i); B:1,3,3,7,5,5,0,0
-            // h = 2, out(2i +3) += out(2i + 1) B:1,3,3,10,5,5,0,5 
-            // h = 4, out(2i + 7) += out(2i + 3) B:1,3,3,10,5,5,0,15 
-            // h = 8, break
-            //this is right -- NEED TO PAD INPUT ARRAY
+            d_out[index] += d_out[h*2* myId + h - 1];
+
+            //NEED TO PAD INPUT ARRAY
         }
         __syncthreads();
     }
 
     //B[n - 1] = 0;
     if (myId == 0) {
-        d_out[size - 1] = 0;// B:1,3,3,10,5,5,0,0
+        d_out[size - 1] = 0;
     } // clear the last element
     __syncthreads();
 
-    //for h = (log n)-1 down to 0 do
-    //    for all i from 0 to n-1 in steps of 2^(h+1) in parallel do
-    //        hlog  = 3,2,1,0 hreal = 8,4,2,1, Good:3,2,1,0
-
-    //        LeftVal = B[i + 2^(h) - 1]; // Save Old Left before modifying
     //        leftval = B[i + h -1]--------------------------
-
-    //        B[i + 2^(h) - 1] = B[i + 2^(h+1) - 1]; // Left child = Parent Node
     //        B[i + (h) - 1] = B[i + (h*2) -1] ---------------------------
-
-    //        B[i + 2^(h+1) - 1] = B[i + 2^(h+1) - 1] + LeftVal; // Right = Parent Node + Old Left
     //        B[i + (h*2) - 1] = B[i + (h*2) -1] + leftVal; ------------------------------
-
-
-    //        ending at >0 to assure we dont reach case where 2^0 is equiv to 0*2
-    
-    // h = log(size) - 1, basically want to do log(size) iterations 
-    //so start with size/4 to 0 dividing by 2 each time
-    
-    for (int h = size/2; h > 0; h /= 2) { //B:1,3,3,10,5,5,0,0 --- might need to do 2*myId still
-        int index = h*2*myId + (h * 2) - 1; // 4 + 1 = 3
-        int right = h*2*myId + h - 1;       // 4 + 0 = 2
+    //0,1,3,6,10,15,21,28, 36,45,55,66,78,91,105,120 - EXPECTED
+                                          
+    for (int h = size/2; h > 0; h /= 2) {
+        int index = h*2*myId + (h * 2) - 1; 
+        int right = h*2*myId + (h*1) - 1;
         if (index < size) { 
             int leftVal = d_out[right];
             d_out[right] = d_out[index];
             d_out[index] += leftVal;
-            //h = 4->0 left = d[3]; d[3] = d[7]; d[7] += left;    left:10   B:1,3,3,0,5,5,0,10 -- only one executes
-            //h = 2->0 left = d[1]; d[1] = d[3]; d[3] += left;    left:3    B:1,0,3,3,5,5,0,10
-            //     ->1 left = d[5]; d[5] = d[7]; d[7] += left;    left:5    B:1,0,3,3,5,10,0,15 -- think thats right
-            //h = 1->0 left = d[0]; d[0] = d[1]; d[1] += left;    left:1    B:0,1,3,3,5,10,0,15
-            //     ->1 left = d[2]; d[2] = d[3]; d[3] += left;    left:3    B:0,1,3,6,5,10,0,15
-            //     ->2 left = d[4]; d[4] = d[5]; d[5] += left;    left:5    B:0,1,3,6,10,15,0,15
-            //     ->3                                                      B:0,1,3,6,10,15,15,15
-            //h = 0, fails out
         }
         __syncthreads();
     }
+
 }
 
 
@@ -104,7 +75,7 @@ __global__ void global_bucket_sort(int* d_out, int* d_in, int* flags, int* scan,
             __syncthreads();
             printf("we haven't failed yet");
             //run prefix scan on 0s - should be inlined??
-            prefix_scan(scan, flags, temp, size);
+            //prefix_scan(scan, flags, size);
             numFalse = scan[size - 1] + flags[size - 1]; // number of falses total
             __syncthreads();
             //scan now holds results of scan from flags
@@ -135,15 +106,35 @@ __global__ void global_bucket_sort(int* d_out, int* d_in, int* flags, int* scan,
 }
 
 
-void bucket(int* d_out, int* d_in, int* flags, int* scan, int* temp, int size) {
+void bucket(int* d_out, int* d_in, int* flags, int* scan, int size) {
     const int maxThreadsPerBlock = 512;
     int threads = maxThreadsPerBlock;
     int blocks = (size / maxThreadsPerBlock) + 1;
-    global_bucket_sort <<<blocks, threads>>> (d_out, d_in, flags, scan, temp, size);
+    //global_bucket_sort <<<blocks, threads>>> (d_out, d_in, flags, scan, temp, size);
+
+    // testing scan///////////////////////////////////////////
+    int* temp;
+    vector<int> temparr;
+    for (int i = 1; i <= 8192; i++) {
+        temparr.push_back(1);
+    }
+    cudaMalloc((void**)&temp, temparr.size() * sizeof(int));
+    cudaMemcpy(temp, &temparr[0], temparr.size() * sizeof(int), cudaMemcpyHostToDevice);
+    printf("starting prefix scan\n");
+    // more than 1024 is messed up, prolly bc 1024 threads per block
+    int tempsize = (8192 / 512);
+    prefix_scan <<<tempsize, 512 >>> (scan, temp, temparr.size());
+    int* ans_scan = (int*)malloc(sizeof(int) * temparr.size());
+    cudaMemcpy(ans_scan, scan, sizeof(int) * temparr.size(), cudaMemcpyDeviceToHost);
+    cout << ans_scan[0];
+    for (int i = 1; i < 8192; i++) {
+        cout << "," << ans_scan[i];
+    }
+    ///////////////////////////////
+
 }
 
-int main()
-{
+int main(){
     vector<int> arr;
     string line;
     ifstream myfile("inp.txt");
@@ -160,12 +151,12 @@ int main()
     //Array A is now accessible as arr
 
     //allocate device memory
-    int* d_arr, *d_out, *scan, *flags, *temp;
+    int* d_arr, *d_out, *scan, *flags;
     cudaMalloc((void**)&d_arr, arr.size() * sizeof(int));
     cudaMalloc((void**)&d_out, arr.size() * sizeof(int));
     cudaMalloc((void**)&flags, arr.size() * sizeof(int));
     cudaMalloc((void**)&scan, arr.size() * sizeof(int));
-    cudaMalloc((void**)&temp, arr.size() * sizeof(int));
+    //cudaMalloc((void**)&temp, arr.size() * sizeof(int));
 
 
     // treat pointer to start of vector as array pointer
@@ -178,7 +169,7 @@ int main()
 
     //run reduce operation
     cudaEventRecord(start, 0);
-    bucket(d_out, d_arr, flags, scan, temp, arr.size());
+    bucket(d_out, d_arr, flags, scan, arr.size());
     cudaEventRecord(stop, 0);
 
     //copy results
