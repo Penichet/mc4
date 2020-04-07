@@ -1,4 +1,3 @@
-
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include <stdio.h>
@@ -8,199 +7,240 @@
 #include <vector>
 using namespace std;
 
-//https://developer.nvidia.com/gpugems/gpugems3/part-vi-gpu-computing/chapter-39-parallel-prefix-sum-scan-cuda
-//child kernel for prefix scan - EXCLUSIVE
 
-__forceinline __device__ void prefix_scan(int* d_out, int* flag, int size) {
-//__global__ void prefix_scan(int* d_out, int* flag, int size) {
-    //TODO: need to adjust size to multiple of 2 and also resize temp array 
-    //__device__ int threadcount;
+__global__ void global_get_flags(int* d_in, int* flags, int mask, int size) {
+    //indices
     int myId = threadIdx.x + blockDim.x * blockIdx.x;
-    //need to initialize all in temp to 0?
-    
-    d_out[myId] = flag[myId]; // load inputs into memory 
 
+    //MAP 0s in d_in as 1 in flags array, vice versa
+    if (myId < size && (mask & d_in[myId]) == 0) {
+        flags[myId] = 1;
+    }
+    else {
+        flags[myId] = 0;
+    }
+    //synch all threads
+    __syncthreads();
+}
+
+
+__global__ void prescan(int* d_out, int* scan_store, int* flag, int size, bool store) {
+    int myId = threadIdx.x + blockDim.x * blockIdx.x;
+    int tid = threadIdx.x;
+    //Blelloch scan that only works on powers of 2. this is mitigated by each block running
+    //512 threads, and scan_store array is padded to powers of 2
+
+    // load inputs into memory 
+    d_out[myId] = flag[myId]; 
+    __syncthreads();
+
+    //terrible log math to index to parent and children vice versa
+    //build up SUM
     for (int h = 1; h < size; h *= 2) {
-        int index = h * 2 * myId + h * 2 - 1;
-        if (index < size) { //check if myid +step is smaller than size
-            d_out[index] += d_out[h * 2 * myId + h - 1];
+        int index = h * 2 * tid + h * 2 - 1 + (size * blockIdx.x);
+        if (index < (size * (blockIdx.x + 1))) { //check if myid +step is smaller than size
+            d_out[index] += d_out[h * 2 * tid + h - 1 + (size * blockIdx.x)];
             //NEED TO PAD INPUT ARRAY
         }
-        __syncthreads(); // only synchs a given block - NEED TO SYNC ACROSS BLOCKS SOMEHOW, ATOMIC INC??
+        __syncthreads(); 
     }
-   /* if (threadIdx.x == 0) {
-        atomicInc(&count, gridDim.x);
-    }*/
-
-    //clear the last element
-    if (myId == 0) {
-        d_out[size - 1] = 0;
+    __syncthreads();
+     //clear the last element
+    if (tid == 0) {
+        d_out[(size * (blockIdx.x+1)) - 1] = 0;
     }
     __syncthreads();
 
-    //        leftval = B[i + h -1]--------------------------
-    //        B[i + (h) - 1] = B[i + (h*2) -1] ---------------------------
-    //        B[i + (h*2) - 1] = B[i + (h*2) -1] + leftVal; ------------------------------
-    //0,1,3,6,10,15,21,28, 36,45,55,66,78,91,105,120 - EXPECTED
-                                          
-    for (int h = size/2; h > 0; h /= 2) {
-        int index = h*2*myId + (h * 2) - 1; 
-        int right = h*2*myId + (h*1) - 1;
-        if (index < size) { 
+    //terrible log math to index to parent and children vice versa
+    //Build down SCAN
+    for (int h = size / 2; h > 0; h /= 2) {
+        int index = h * 2 * tid + (h * 2) - 1 + (size * blockIdx.x);
+        int right = h * 2 * tid + (h * 1) - 1 + (size * blockIdx.x);
+        if (index < (size * (blockIdx.x+1))) {
             int leftVal = d_out[right];
             d_out[right] = d_out[index];
             d_out[index] += leftVal;
         }
         __syncthreads();
     }
+    __syncthreads();
+    //store the last element if thread 0 at block index
+    if (tid == size -1 && store) {
+        scan_store[blockIdx.x] = d_out[(size * (blockIdx.x + 1)) - 1] + flag[(size * (blockIdx.x + 1)-1)];
+    }
+    __syncthreads();
 }
 
-__device__ int numFalse;
-__device__ unsigned int threadcount;
-__device__ bool ready;
-
-__global__ void global_bucket_sort(int* d_out, int* d_in, int* flags, int* scan, int size) {
-    //indices
-    ready = false;
+__global__ void combine(int* results, int* mini, int size, int* numFalse, int* scan) {
     int myId = threadIdx.x + blockDim.x * blockIdx.x;
-    
-    //int tid = threadIdx.x;
-    int mask = 1;
-    
+    //shared value for each block to only do once
+    __shared__ int presum;
+    if (threadIdx.x == 0) {
+        presum = mini[blockIdx.x];
+    }
+    __syncthreads();
+    // add total scan of each block to each element
     if (myId < size) {
-        // for every bit, increase mask 1 bit 
-        //for (int i = 0; i < 10; i++, mask <<= 1) {
-        for (int i = 0; i < 10; i++, mask <<= 1) {
-            //MAP 0s as 1 in flags array
-            if ((mask & d_in[myId]) == 0) {
-                flags[myId] = 1;
-            }
-            //FLAGS WORKS JUST FINE
+        results[myId] += presum;
+    }
+    __syncthreads();
 
-            //synch all threads
-            __syncthreads();
+    // store largest num in numFalse pointer location
+    if (myId == size -1 ) {
+        *numFalse = results[size - 1] + scan[size -1];
+        //printf("num false cuda: %d\n", d_out[size - 1]);
+    }
+    __syncthreads();
 
-            prefix_scan(scan, flags, size);
-            
-            // up to here works perfectly
-            
-            //half the threads pass sync barrier and print numfalse as 514 first
-            numFalse = scan[size - 1] + flags[size - 1]; // number of falses total
-            __syncthreads();
-            
-            //make sure somehow all threads wait to have most up to date numFalse
-            //if (atomicInc(&threadcount, 1) == 10) {
-            //    numFalse = scan[size - 1] + flags[size - 1];
-            //    ready = true;
-            //}
-            //while (!ready) {
-            //    //do nothing until all threads ready
-            //}
-            __syncthreads();
-            //printf("numFalse: %d\n", numFalse);
-            
+}
 
-            int t = myId - scan[myId] + numFalse; // true index for all
-            __syncthreads();
+__global__ void shuffle(int* d_out, int* d_in, int* scan, int* numFalse, int size, int mask) {
+    //overlap at 1015 at end of cycle with storing indices
+    int myId = threadIdx.x + blockDim.x * blockIdx.x;
+    int t;
+        if(myId<size)
+            t = myId - scan[myId] + *numFalse; // true index for all
+        __syncthreads();
 
-            //use scan value if bit is 0, use t otherwise
+        //use scan value if bit is 0, use t otherwise
+        if (myId < size)
             if ((mask & d_in[myId]) == 0) d_out[scan[myId]] = d_in[myId];
             else d_out[t] = d_in[myId];
-            __syncthreads();
+        __syncthreads();
 
-            ////copy to d_in to redo next layer
-            d_in[myId] = d_out[myId];
-            __syncthreads();
-
-            //clear used arrays
-            flags[myId] = 0;
-            scan[myId] = 0;
-            __syncthreads();
-            //run next bit mask
-        }
-    }
+    ////run next bit mask
 }
 
-
-void bucket(int* d_out, int* d_in, int* flags, int* scan, int size) {
-   
-    //size over 10000 bugs out????
-    const int maxThreadsPerBlock = 512;
-    int threads = maxThreadsPerBlock;
-    int blocks = (size / maxThreadsPerBlock);
-    if (size % threads != 0) {
-        blocks++;
-    }
-    //more than 1024 is messed up, prolly bc 1024 threads per block
-    global_bucket_sort <<<blocks, threads>>> (d_out, d_in, flags, scan, size);
-
-
-    //prefix_scan <<<blocks, threads >>> (scan, temp, temparr.size());
-    /*int* ans_scan = (int*)malloc(sizeof(int) * temparr.size());
-    cudaMemcpy(ans_scan, d_out, sizeof(int) * temparr.size(), cudaMemcpyDeviceToHost);
-    cout << ans_scan[0];
-    for (int i = 1; i < size; i++) {
-        cout << "," << ans_scan[i];
-    }*/
-    /////////////////////////////
-
+__global__ void swap(int* d_in, int* d_out, int size) {
+    //Stores each valid element from d_out to d_in, all in parallel
+    int myId = threadIdx.x + blockDim.x * blockIdx.x;
+    __syncthreads();
+    if(myId < size) d_in[myId] = d_out[myId];
+    __syncthreads();
 }
 
-int main(){
+int main() {
     //READING ONLY 8192 for simplicity, no padding
-    int size = 512;
+    /*
+    TODO: Account for each thread taking care of 2 elements in prescan
+    */
     vector<int> arr;
     string line;
     ifstream myfile("inp.txt");
+    ofstream outfile2("q4.txt");
     if (myfile.is_open())
     {
         //gets next int
-        int numin = 0;
-        while (getline(myfile, line, ',') && numin<size)
+        //int numin = 0;
+        while (getline(myfile, line, ','))
         {
             arr.push_back(stoi(line, nullptr));
-            numin++;
+            //arr.push_back(2); DEBUG
+            //numin++;
         }
         myfile.close();
     }
-    else cout << "Unable to open file";
-    //Array A is now accessible as arr
-    printf("size of arr: %d", arr.size());
+    //size calculations plus padding
+    int size = arr.size();
+    //cout << arr.size() << endl;
+    const int maxThreadsPerBlock = 1024;
+    int threads = maxThreadsPerBlock;
+    int blocks = (size / maxThreadsPerBlock);
+    int padblocks = 1;
+    int mod = size % threads;
+    if (mod > 0) blocks++;
+    //padding for block cudamalloc
+    while (padblocks < blocks) padblocks *= 2;
+    //bootleg push 2 for everything, try to not shuffle the end
+    for (int i = 0; i < threads - mod; i++) {
+        arr.push_back(2);
+    }
+
     //allocate device memory
-    int* d_arr, *d_out, *scan, *flags;
-    cudaMalloc((void**)&d_arr, arr.size() * sizeof(int));
-    cudaMalloc((void**)&d_out, arr.size() * sizeof(int));
+    int* d_in, * d_out, * scan, * flags, * scan_store, * scan_large, *numFalse;
+    //int* h_false = (int*)malloc(sizeof(int));
+    
+    //allocate memory for full size of padded blocks, only write to actual values
     cudaMalloc((void**)&flags, arr.size() * sizeof(int));
+    cudaMalloc((void**)&d_out, arr.size() * sizeof(int));
     cudaMalloc((void**)&scan, arr.size() * sizeof(int));
-
+    cudaMalloc((void**)&scan_store, padblocks * sizeof(int));
+    cudaMalloc((void**)&scan_large, padblocks * sizeof(int));
+    cudaMalloc((void**)&numFalse, sizeof(int));
     // treat pointer to start of vector as array pointer
-    cudaMemcpy(d_arr, &arr[0], arr.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMalloc((void**)&d_in, arr.size() * sizeof(int));
+    cudaMemcpy(d_in, &arr[0], arr.size() * sizeof(int), cudaMemcpyHostToDevice);
+    
 
-    //Cuda Events
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    ///////////////////////////////////////////////////////////////////////////
+    //For each bit 0-999
+    for (int i = 0, mask = 1; i < 10; i++, mask <<= 1) {
+        //MAP 0's to flags array
+        global_get_flags<<<blocks, threads>>>(d_in, flags, mask, size);
+        cudaDeviceSynchronize();
 
-    //run reduce operation
-    cudaEventRecord(start, 0);
-    bucket(d_out, d_arr, flags, scan, arr.size());
-    cudaEventRecord(stop, 0);
+        //do first scan on each block and store results in scan_store array
+        prescan<<<blocks, threads>>>(scan, scan_store, flags, threads, true);
+        cudaDeviceSynchronize();
+        //DEBUG
+        /*int* h_scan = (int*)malloc(sizeof(int) * blocks);
+        cudaMemcpy(h_scan, scan_store, sizeof(int) * blocks, cudaMemcpyDeviceToHost);
+        cout << "SCAN_STORE: " << h_scan[0];
+        for (int j = 1; j < blocks; j++) {
+            cout << "," << h_scan[j];
+        }
+        cout << endl;*/
+        //////////////////////////
 
-    //copy results
-    int* ans_arr = (int*)malloc(sizeof(int) * arr.size());
-    cudaMemcpy(ans_arr, d_out, sizeof(int) * arr.size(), cudaMemcpyDeviceToHost);
-    //cudaMemcpy(ans_arr, flags, sizeof(int) * arr.size(), cudaMemcpyDeviceToHost);
+        //do secondary scan on array of scan results 
+        prescan<<<1, blocks >>>(scan_large, NULL, scan_store, padblocks, false);
+        cudaDeviceSynchronize();
 
-   // output to file
-    ofstream outfile2("q4.txt");
+        // Combine scans in parallel
+        combine<<<blocks, threads>>>(scan, scan_large, size, numFalse, flags);
+        cudaDeviceSynchronize();
+
+        //DEBUG
+        /*cudaMemcpy(h_false, numFalse, sizeof(int), cudaMemcpyDeviceToHost);
+        printf("number of false: %d\n", h_false[0]);*/
+
+        //shuffle to new values
+        shuffle<<<blocks, threads>>>(d_out, d_in, scan, numFalse, size, mask);
+        cudaDeviceSynchronize();
+
+        ////move d_out to d_in to redo, must do in seperate kernel to avoid race conditions
+        swap<<<blocks, threads>>>(d_in, d_out, size);
+        cudaDeviceSynchronize();
+    }
+
+    /////////////////////////////////////////////////////////////////////////
+    //Copy results to host from device
+    int* ans_arr = (int*)malloc(sizeof(int) * (arr.size() + mod));
+    cudaMemcpy(ans_arr, d_in, sizeof(int) * arr.size(), cudaMemcpyDeviceToHost);
+
+    // output to file   
     if (outfile2.is_open())
-    {
+    {       
         //avoid comma at end of string
         outfile2 << ans_arr[0];
-        for (int i = 1; i < arr.size(); i++) {
+
+        //append integers up to original input size
+        for (int i = 1; i < size; i++) {
             outfile2 << "," << ans_arr[i];
         }
 
         outfile2.close();
     }
+
+    //free mem
+    cudaFree(d_in);
+    cudaFree(d_out);
+    cudaFree(scan);
+    cudaFree(scan_store);
+    cudaFree(scan_large);
+    cudaFree(flags);
+    cudaFree(numFalse);
+    free(ans_arr);
 }
+
+
