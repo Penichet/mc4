@@ -9,30 +9,33 @@
 using namespace std;
 
 //https://developer.nvidia.com/gpugems/gpugems3/part-vi-gpu-computing/chapter-39-parallel-prefix-sum-scan-cuda
-//child kernel for prefix scan - NOT SURE IF INCLUSIVE OR EXCLUSIVE
-//__device__ void prefix_scan(int* d_out, int* flag, int* temp,  int size) {
-__global__ void prefix_scan(int* d_out, int* flag, int size) {
-    //TODO: need to adjust size to multiple of 2 and also resize temp array 
+//child kernel for prefix scan - EXCLUSIVE
 
+__forceinline __device__ void prefix_scan(int* d_out, int* flag, int size) {
+//__global__ void prefix_scan(int* d_out, int* flag, int size) {
+    //TODO: need to adjust size to multiple of 2 and also resize temp array 
+    //__device__ int threadcount;
     int myId = threadIdx.x + blockDim.x * blockIdx.x;
     //need to initialize all in temp to 0?
     
     d_out[myId] = flag[myId]; // load inputs into memory 
 
     for (int h = 1; h < size; h *= 2) {
-        int index = h*2* myId + h * 2 - 1;
-        if(index < size) { //check if myid +step is smaller than size
-            d_out[index] += d_out[h*2* myId + h - 1];
-
+        int index = h * 2 * myId + h * 2 - 1;
+        if (index < size) { //check if myid +step is smaller than size
+            d_out[index] += d_out[h * 2 * myId + h - 1];
             //NEED TO PAD INPUT ARRAY
         }
-        __syncthreads();
+        __syncthreads(); // only synchs a given block - NEED TO SYNC ACROSS BLOCKS SOMEHOW, ATOMIC INC??
     }
+   /* if (threadIdx.x == 0) {
+        atomicInc(&count, gridDim.x);
+    }*/
 
-    //B[n - 1] = 0;
+    //clear the last element
     if (myId == 0) {
         d_out[size - 1] = 0;
-    } // clear the last element
+    }
     __syncthreads();
 
     //        leftval = B[i + h -1]--------------------------
@@ -50,49 +53,62 @@ __global__ void prefix_scan(int* d_out, int* flag, int size) {
         }
         __syncthreads();
     }
-
 }
 
+__device__ int numFalse;
+__device__ unsigned int threadcount;
+__device__ bool ready;
 
-
-__global__ void global_bucket_sort(int* d_out, int* d_in, int* flags, int* scan,int* temp, int size) {
+__global__ void global_bucket_sort(int* d_out, int* d_in, int* flags, int* scan, int size) {
     //indices
+    ready = false;
     int myId = threadIdx.x + blockDim.x * blockIdx.x;
-    __shared__ int numFalse;
+    
     //int tid = threadIdx.x;
     int mask = 1;
     
     if (myId < size) {
         // for every bit, increase mask 1 bit 
+        //for (int i = 0; i < 10; i++, mask <<= 1) {
         for (int i = 0; i < 10; i++, mask <<= 1) {
-
             //MAP 0s as 1 in flags array
-            if ((mask & d_in[myId])==0) {
-                //if (tid == 0) printf("masking %d with %d, returned 0", d_in[myId], mask);
+            if ((mask & d_in[myId]) == 0) {
                 flags[myId] = 1;
             }
+            //FLAGS WORKS JUST FINE
+
             //synch all threads
             __syncthreads();
-            printf("we haven't failed yet");
-            //run prefix scan on 0s - should be inlined??
-            //prefix_scan(scan, flags, size);
+
+            prefix_scan(scan, flags, size);
+            
+            // up to here works perfectly
+            
+            //half the threads pass sync barrier and print numfalse as 514 first
             numFalse = scan[size - 1] + flags[size - 1]; // number of falses total
             __syncthreads();
-            //scan now holds results of scan from flags
+            
+            //make sure somehow all threads wait to have most up to date numFalse
+            //if (atomicInc(&threadcount, 1) == 10) {
+            //    numFalse = scan[size - 1] + flags[size - 1];
+            //    ready = true;
+            //}
+            //while (!ready) {
+            //    //do nothing until all threads ready
+            //}
+            __syncthreads();
+            //printf("numFalse: %d\n", numFalse);
+            
 
             int t = myId - scan[myId] + numFalse; // true index for all
             __syncthreads();
 
-            //if bit true, use t index
-            if (mask & d_in[myId] != 0) {
-                d_out[t] = d_in[myId];
-            }
-            else { //if bit false, use scan index aka f index
-                d_out[scan[myId]] = d_in[myId];
-            }
+            //use scan value if bit is 0, use t otherwise
+            if ((mask & d_in[myId]) == 0) d_out[scan[myId]] = d_in[myId];
+            else d_out[t] = d_in[myId];
             __syncthreads();
 
-            //copy to d_in to redo next layer
+            ////copy to d_in to redo next layer
             d_in[myId] = d_out[myId];
             __syncthreads();
 
@@ -107,49 +123,69 @@ __global__ void global_bucket_sort(int* d_out, int* d_in, int* flags, int* scan,
 
 
 void bucket(int* d_out, int* d_in, int* flags, int* scan, int size) {
+    size = 512;
+    //size over 10000 bugs out????
     const int maxThreadsPerBlock = 512;
     int threads = maxThreadsPerBlock;
-    int blocks = (size / maxThreadsPerBlock) + 1;
-    //global_bucket_sort <<<blocks, threads>>> (d_out, d_in, flags, scan, temp, size);
+    int blocks = (size / maxThreadsPerBlock);
+    if (size % threads > 0) {
+        blocks++;
+    }
+    //global_bucket_sort <<<blocks, threads>>> (d_out, d_in, flags, scan, size);
 
-    // testing scan///////////////////////////////////////////
+    ////////// testing scan///////////////////////////////////////////
     int* temp;
     vector<int> temparr;
-    for (int i = 1; i <= 8192; i++) {
-        temparr.push_back(1);
+    string line;
+    ifstream myfile("inp.txt");
+    if (myfile.is_open())
+    {
+        //gets next int
+        int numin = 0;
+        while (getline(myfile, line, ',') && numin < 512)
+        {
+            temparr.push_back(stoi(line, nullptr));
+            numin++;
+        }
+        myfile.close();
     }
     cudaMalloc((void**)&temp, temparr.size() * sizeof(int));
     cudaMemcpy(temp, &temparr[0], temparr.size() * sizeof(int), cudaMemcpyHostToDevice);
-    printf("starting prefix scan\n");
-    // more than 1024 is messed up, prolly bc 1024 threads per block
-    int tempsize = (8192 / 512);
-    prefix_scan <<<tempsize, 512 >>> (scan, temp, temparr.size());
+    //printf("starting prefix scan\n");
+    //more than 1024 is messed up, prolly bc 1024 threads per block
+    global_bucket_sort <<<1, 512>>> (d_out, temp, flags, scan, size);
+
+
+    //prefix_scan <<<blocks, threads >>> (scan, temp, temparr.size());
     int* ans_scan = (int*)malloc(sizeof(int) * temparr.size());
-    cudaMemcpy(ans_scan, scan, sizeof(int) * temparr.size(), cudaMemcpyDeviceToHost);
+    cudaMemcpy(ans_scan, d_out, sizeof(int) * temparr.size(), cudaMemcpyDeviceToHost);
     cout << ans_scan[0];
-    for (int i = 1; i < 8192; i++) {
+    for (int i = 1; i < size; i++) {
         cout << "," << ans_scan[i];
     }
-    ///////////////////////////////
+    /////////////////////////////
 
 }
 
 int main(){
+    //READING ONLY 8192 for simplicity, no padding
     vector<int> arr;
     string line;
     ifstream myfile("inp.txt");
     if (myfile.is_open())
     {
         //gets next int
-        while (getline(myfile, line, ','))
+        int numin = 0;
+        while (getline(myfile, line, ',') && numin<512)
         {
             arr.push_back(stoi(line, nullptr));
+            numin++;
         }
         myfile.close();
     }
     else cout << "Unable to open file";
     //Array A is now accessible as arr
-
+    printf("size of arr: %d", arr.size());
     //allocate device memory
     int* d_arr, *d_out, *scan, *flags;
     cudaMalloc((void**)&d_arr, arr.size() * sizeof(int));
@@ -174,18 +210,19 @@ int main(){
 
     //copy results
     int* ans_arr = (int*)malloc(sizeof(int) * arr.size());
-    cudaMemcpy(ans_arr, d_out, sizeof(int) * arr.size(), cudaMemcpyDeviceToHost);
+    //cudaMemcpy(ans_arr, flags, sizeof(int) * arr.size(), cudaMemcpyDeviceToHost);
+    cudaMemcpy(ans_arr, flags, sizeof(int) * arr.size(), cudaMemcpyDeviceToHost);
 
     //output to file
-    ofstream outfile2("q4.txt");
-    if (outfile2.is_open())
-    {
-        //avoid comma at end of string
-        outfile2 << ans_arr[0];
-        for (int i = 1; i < arr.size(); i++) {
-            outfile2 << "," << ans_arr[i];
-        }
+    //ofstream outfile2("q4.txt");
+    //if (outfile2.is_open())
+    //{
+    //    //avoid comma at end of string
+    //    outfile2 << ans_arr[0];
+    //    for (int i = 1; i < arr.size(); i++) {
+    //        outfile2 << "," << ans_arr[i];
+    //    }
 
-        outfile2.close();
-    }
+    //    outfile2.close();
+    //}
 }
